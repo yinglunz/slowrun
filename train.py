@@ -49,6 +49,8 @@ parser.add_argument("--input_val_bin", type=str, default=None)
 parser.add_argument("--output_json", type=str, default=None)
 parser.add_argument("--wandb_group", type=str, default=None)
 parser.add_argument("--dropout", type=float, default=0.1)
+parser.add_argument("--dropout-end", type=float, default=0.15)
+parser.add_argument("--dropout-increase-start-epoch", type=int, default=7)
 args = parser.parse_args()
 
 # Resolve output path
@@ -108,7 +110,7 @@ class DummyWandb:
     def finish(self): pass
 
 # =============================================================================
-# Flash Attention (FA3 on Hopper)
+# Flash Attention (FA3 on Hopper, SDPA fallback elsewhere)
 # =============================================================================
 
 def _load_fa3():
@@ -126,9 +128,32 @@ def _load_fa3():
 
 _fa3 = _load_fa3()
 
+def _sdpa_attention(q, k, v, window_size, enable_gqa):
+    Tq, Tk = q.size(2), k.size(2)
+    window = window_size[0]
+    if (window < 0 or window >= Tq) and Tq == Tk:
+        return F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
+    if Tq == 1:
+        if window >= 0 and window < Tk:
+            start = max(0, Tk - (window + 1))
+            k, v = k[:, :, start:, :], v[:, :, start:, :]
+        return F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
+    device = q.device
+    row_idx = (Tk - Tq) + torch.arange(Tq, device=device).unsqueeze(1)
+    col_idx = torch.arange(Tk, device=device).unsqueeze(0)
+    mask = col_idx <= row_idx
+    if window >= 0 and window < Tk:
+        mask = mask & ((row_idx - col_idx) <= window)
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
+
 def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
-    """Flash Attention for training (FA3 only). q,k,v: (B, T, H, D)."""
-    return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+    """Flash Attention for training. q,k,v: (B, T, H, D)."""
+    if _fa3 is not None:
+        return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+    q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+    enable_gqa = q.size(1) != k.size(1)
+    y = _sdpa_attention(q, k, v, window_size, enable_gqa)
+    return y.transpose(1, 2)
 
 flash_attn = SimpleNamespace(flash_attn_func=flash_attn_func)
 
@@ -172,11 +197,10 @@ class CausalSelfAttention(nn.Module):
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.resid_dropout = nn.Dropout(config.dropout)
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size):
+    def forward(self, x, ve, cos_sin, window_size, dropout_p):
         B, T, C = x.size()
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
@@ -191,7 +215,7 @@ class CausalSelfAttention(nn.Module):
         q, k = norm(q), norm(k)
         y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         y = y.contiguous().view(B, T, -1)
-        return self.resid_dropout(self.c_proj(y))
+        return F.dropout(self.c_proj(y), p=dropout_p, training=self.training)
 
 
 class MLP(nn.Module):
@@ -199,10 +223,9 @@ class MLP(nn.Module):
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
-        self.resid_dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x):
-        return self.resid_dropout(self.c_proj(F.relu(self.c_fc(x)).square()))
+    def forward(self, x, dropout_p):
+        return F.dropout(self.c_proj(F.relu(self.c_fc(x)).square()), p=dropout_p, training=self.training)
 
 
 class Block(nn.Module):
@@ -211,9 +234,9 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
+    def forward(self, x, ve, cos_sin, window_size, dropout_p):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, dropout_p)
+        x = x + self.mlp(norm(x), dropout_p)
         return x
 
 
@@ -239,6 +262,7 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
+        self.register_buffer("dropout_p", torch.tensor(config.dropout), persistent=False)
 
     @torch.no_grad()
     def init_weights(self):
@@ -328,7 +352,7 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
+            x = block(x, ve, cos_sin, self.window_sizes[i], self.dropout_p)
         x = norm(x)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
         logits = 15 * torch.tanh(logits / 15)  # softcap
@@ -393,6 +417,9 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     wd = wd_t.to(g.dtype)
     mask = (g * stacked_params) >= 0
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+
+
+
 
 class DistMuonAdamW(torch.optim.Optimizer):
     """Distributed MuonAdamW with ZeRO-2 style sharding."""
@@ -552,7 +579,7 @@ class DataLoader:
 
     def __iter__(self):
         return self
-
+    
     def _shuffle(self):
         """Shuffle batch order for the new epoch, consistent across ranks."""
         g = torch.Generator()
@@ -638,11 +665,11 @@ if device_type == "cuda":
 if _fa3 is not None:
     print0("Using Flash Attention 3 (Hopper GPU detected)")
 else:
-    raise RuntimeError("Flash Attention 3 is required but not available. A Hopper (sm90) GPU is needed.")
+    print0("Using PyTorch SDPA fallback (no FA3)")
 
 # wandb
 run_name = args.run if args.run else time.strftime("%Y%m%d_%H%M%S")
-_wandb_kwargs = {"project": "nanochat", "name": run_name}
+_wandb_kwargs = {"project": "nanochat-slowrun", "name": run_name}
 if args.wandb_group:
     _wandb_kwargs["group"] = args.wandb_group
 wandb_run = DummyWandb() if not master_process else wandb.init(**_wandb_kwargs)
@@ -725,6 +752,15 @@ def get_lr_multiplier(it):
         progress = (num_iterations - it) / warmdown
         return progress + (1 - progress) * FINAL_LR_FRAC
 
+def get_dropout(it):
+    if args.dropout_end is None or args.dropout_end <= args.dropout:
+        return args.dropout
+    start_step = round(max(0, args.dropout_increase_start_epoch - 1) / args.num_epochs * num_iterations)
+    if it < start_step:
+        return args.dropout
+    progress = min(1.0, (it - start_step) / max(1, num_iterations - start_step))
+    return args.dropout + progress * (args.dropout_end - args.dropout)
+
 def get_muon_momentum(it):
     return (1 - min(it / 300, 1)) * 0.85 + min(it / 300, 1) * 0.95
 
@@ -767,6 +803,9 @@ while current_epoch <= args.num_epochs:
             group["momentum"] = get_muon_momentum(step)
     optimizer.step()
     model.zero_grad(set_to_none=True)
+    # Dropout schedule
+    new_p = get_dropout(step)
+    orig_model.dropout_p.fill_(new_p)
     train_loss_f = train_loss.item()
     synchronize()
     dt = time.time() - t0
@@ -785,7 +824,7 @@ while current_epoch <= args.num_epochs:
     steps_done = step - 10
     eta_str = f" | eta: {(num_iterations - step) * total_training_time / steps_done / 60:.1f}m" if steps_done > 0 else ""
     print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{eta_str}")
-    wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu})
+    wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu, "train/dropout": new_p})
 
     # Synchronize epoch across ranks (different ranks may exhaust data at different steps)
     if ddp:
